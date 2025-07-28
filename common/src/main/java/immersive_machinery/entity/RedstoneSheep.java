@@ -201,7 +201,10 @@ public class RedstoneSheep extends NavigatingMachine {
     private void work(BlockPos pos) {
         BlockState state = level().getBlockState(pos);
         if (level() instanceof ServerLevel serverLevel) {
-            // Collect drops
+            Block block = state.getBlock();
+            String blockKey = BuiltInRegistries.BLOCK.getKey(block).toString();
+            
+            // 收集掉落物
             Block.getDrops(state, serverLevel, pos, null).forEach(stack -> {
                 ItemStack remainder = addItem(stack);
                 if (!remainder.isEmpty()) {
@@ -209,20 +212,102 @@ public class RedstoneSheep extends NavigatingMachine {
                 }
             });
 
-            // Harvest or set age to 0 if possible
-            getAgeProperty(state).ifPresentOrElse(
-                    age -> serverLevel.setBlockAndUpdate(pos, state.setValue(age, 0)),
-                    () -> serverLevel.destroyBlock(pos, false)
-            );
+            // 收获或重置成长阶段
+            boolean harvestSuccessful = false;
+            
+            // 尝试重置成长阶段而不是破坏方块（对于可重复收获的作物）
+            Optional<Property<Integer>> ageProperty = getAgeProperty(state);
+            if (ageProperty.isPresent()) {
+                Property<Integer> property = ageProperty.get();
+                
+                // 对于某些模组作物，可能需要特殊的收获处理
+                if (isReharvestable(blockKey)) {
+                    // 重复收获的作物，重置到某个阶段而不是0
+                    int resetAge = getResetAge(blockKey, property);
+                    serverLevel.setBlockAndUpdate(pos, state.setValue(property, resetAge));
+                    harvestSuccessful = true;
+                } else {
+                    // 一次性收获的作物，重置到0
+                    serverLevel.setBlockAndUpdate(pos, state.setValue(property, 0));
+                    harvestSuccessful = true;
+                }
+            }
+            
+            // 如果没有成长属性或特殊处理失败，直接破坏方块
+            if (!harvestSuccessful) {
+                if (shouldDestroyBlock(blockKey)) {
+                    serverLevel.destroyBlock(pos, false);
+                } else {
+                    // 对于一些永久性作物（如浆果丛），什么都不做
+                }
+            }
 
-            // Burn fuel
+            // 消耗燃料
             consumeFuel(Config.getInstance().fuelTicksPerHarvest);
 
-            // Spawn particles
-            serverLevel.sendParticles(new BlockParticleOption(ParticleTypes.FALLING_DUST, state), pos.getX(), pos.getY(), pos.getZ(), 10, 0.5, 0.0, 0.5, 1.0);
+            // 生成粒子效果
+            serverLevel.sendParticles(new BlockParticleOption(ParticleTypes.FALLING_DUST, state), 
+                pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5, 10, 0.5, 0.5, 0.5, 1.0);
 
-            // Make sound
-            serverLevel.playSound(null, pos, SoundEvents.PLAYER_ATTACK_SWEEP, SoundSource.BLOCKS, 1.0f, 1.2f);
+            // 播放声音
+            SoundEvent harvestSound = getHarvestSound(blockKey);
+            serverLevel.playSound(null, pos, harvestSound, SoundSource.BLOCKS, 1.0f, 1.2f);
+        }
+    }
+    
+    /**
+     * 检查作物是否可以重复收获（如浆果丛、竹子等）
+     */
+    private static boolean isReharvestable(String blockKey) {
+        return blockKey.contains("berry") || blockKey.contains("bush") || 
+               blockKey.contains("vine") || blockKey.contains("bamboo") ||
+               blockKey.startsWith("farmersdelight:rice") ||
+               blockKey.contains("sweet_berry") || blockKey.contains("glow_berry");
+    }
+    
+    /**
+     * 获取作物重置后的年龄
+     */
+    private static int getResetAge(String blockKey, Property<Integer> property) {
+        // 对于大多数可重复收获的作物，重置到某个中间阶段
+        if (blockKey.contains("berry") || blockKey.contains("bush")) {
+            // 浆果丛类型，通常重置到阶段1或2
+            return Math.max(1, Collections.min(property.getPossibleValues()));
+        }
+        
+        // 默认重置到最小值
+        return Collections.min(property.getPossibleValues());
+    }
+    
+    /**
+     * 检查是否应该破坏方块
+     */
+    private static boolean shouldDestroyBlock(String blockKey) {
+        // 对于永久性的作物，不要破坏方块
+        if (blockKey.contains("berry") && blockKey.contains("bush")) {
+            return false; // 浆果丛不破坏
+        }
+        
+        if (blockKey.contains("vine") || blockKey.contains("bamboo")) {
+            return false; // 藤蔓和竹子不破坏
+        }
+        
+        // 默认情况下破坏方块
+        return true;
+    }
+    
+    /**
+     * 获取收获时的声音效果
+     */
+    private static SoundEvent getHarvestSound(String blockKey) {
+        if (blockKey.contains("berry") || blockKey.contains("fruit")) {
+            return SoundEvents.SWEET_BERRY_BUSH_PICK_BERRIES;
+        } else if (blockKey.contains("bamboo")) {
+            return SoundEvents.BAMBOO_BREAK;
+        } else if (blockKey.contains("vine")) {
+            return SoundEvents.VINE_BREAK;
+        } else {
+            return SoundEvents.PLAYER_ATTACK_SWEEP;
         }
     }
 
@@ -257,30 +342,155 @@ public class RedstoneSheep extends NavigatingMachine {
      */
     public static boolean isCrop(Block block) {
         String key = BuiltInRegistries.BLOCK.getKey(block).toString();
+        
+        // 首先检查配置文件中明确指定的作物
         if (Config.getInstance().validCrops.containsKey(key)) {
             return Config.getInstance().validCrops.get(key);
-        } else {
-            return block instanceof CropBlock || block instanceof NetherWartBlock || block instanceof CocoaBlock || block instanceof PitcherCropBlock;
         }
+        
+        // 如果启用了类检测，检查是否为原版作物类型
+        if (Config.getInstance().enableCropClassDetection) {
+            if (block instanceof CropBlock || block instanceof NetherWartBlock || 
+                block instanceof CocoaBlock || block instanceof PitcherCropBlock) {
+                return true;
+            }
+        }
+        
+        // 如果启用了模组作物自动检测，使用更智能的检测方法
+        if (Config.getInstance().enableModdedCropAutoDetection) {
+            String blockName = key.toLowerCase();
+            String className = block.getClass().getSimpleName().toLowerCase();
+            
+            // 通过方块名称检测作物
+            if (blockName.contains("crop") || blockName.contains("plant") || 
+                blockName.contains("berry") || blockName.contains("bush") ||
+                blockName.contains("vine") || blockName.contains("stem")) {
+                return true;
+            }
+            
+            // 通过类名检测作物
+            if (className.contains("crop") || className.contains("plant") || 
+                className.contains("berry") || className.contains("bush") ||
+                className.contains("vine") || className.contains("stem")) {
+                return true;
+            }
+            
+            // 检查常见模组前缀
+            String[] modPrefixes = {
+                "farmersdelight:", "croptopia:", "pamhc2crops:", "mysticalworld:",
+                "supplementaries:", "immersive_agriculture:", "croparia:",
+                "mysticalagriculture:", "harvestcraft:", "actuallyadditions:",
+                "botania:", "forestry:", "industrialcraft:", "thermalexpansion:"
+            };
+            
+            for (String prefix : modPrefixes) {
+                if (blockName.startsWith(prefix)) {
+                    return true;
+                }
+            }
+        }
+        
+        return false;
     }
 
     public static Optional<Property<Integer>> getAgeProperty(BlockState state) {
+        // 尝试所有支持的成熟度属性名称
+        for (String propertyName : Config.getInstance().supportedMaturityProperties) {
+            for (Property<?> property : state.getProperties()) {
+                if (property.getName().equals(propertyName)) {
+                    try {
+                        //noinspection unchecked
+                        return Optional.of((Property<Integer>) property);
+                    } catch (ClassCastException e) {
+                        // 如果不是Integer类型，继续尝试下一个
+                        continue;
+                    }
+                }
+            }
+        }
+        
+        // 如果没有找到标准属性名，尝试寻找任何包含相关关键词的Integer属性
         for (Property<?> property : state.getProperties()) {
-            if (property.getName().equals("age")) {
+            String propName = property.getName().toLowerCase();
+            if ((propName.contains("age") || propName.contains("growth") || 
+                 propName.contains("stage") || propName.contains("maturity") ||
+                 propName.contains("progress") || propName.contains("level")) &&
+                property.getValueClass() == Integer.class) {
                 try {
                     //noinspection unchecked
                     return Optional.of((Property<Integer>) property);
                 } catch (ClassCastException e) {
-                    return Optional.empty();
+                    // 继续寻找
                 }
             }
         }
+        
         return Optional.empty();
     }
 
     public static boolean isMature(BlockState state) {
-        return getAgeProperty(state)
-                .filter(p -> !Objects.equals(state.getValue(p), Collections.max(p.getPossibleValues()))).isEmpty();
+        Optional<Property<Integer>> ageProperty = getAgeProperty(state);
+        
+        if (ageProperty.isPresent()) {
+            Property<Integer> property = ageProperty.get();
+            Integer currentValue = state.getValue(property);
+            Integer maxValue = Collections.max(property.getPossibleValues());
+            
+            // 检查当前值是否等于最大值
+            return Objects.equals(currentValue, maxValue);
+        }
+        
+        // 如果没有找到成熟度属性，尝试一些特殊的检测方法
+        Block block = state.getBlock();
+        String blockKey = BuiltInRegistries.BLOCK.getKey(block).toString();
+        
+        // 对于一些特殊的模组作物，可能需要特殊的成熟度检测
+        if (blockKey.startsWith("farmersdelight:")) {
+            // 农夫乐事的一些作物可能有特殊的成熟检测
+            return checkFarmersDelightMaturity(state);
+        } else if (blockKey.startsWith("mysticalagriculture:")) {
+            // 神秘农艺的作物可能有特殊的成熟检测
+            return checkMysticalAgricultureMaturity(state);
+        }
+        
+        // 如果没有成熟度属性且不是特殊作物，假设它总是成熟的
+        // 这对于一些简单的模组作物（如浆果丛）可能是合适的
+        return true;
+    }
+    
+    private static boolean checkFarmersDelightMaturity(BlockState state) {
+        // 农夫乐事的特殊成熟度检测逻辑
+        // 检查常见的农夫乐事属性
+        for (Property<?> property : state.getProperties()) {
+            String propName = property.getName();
+            if (propName.equals("age") || propName.equals("maturity")) {
+                if (property.getValueClass() == Integer.class) {
+                    @SuppressWarnings("unchecked")
+                    Property<Integer> intProperty = (Property<Integer>) property;
+                    Integer currentValue = state.getValue(intProperty);
+                    Integer maxValue = Collections.max(intProperty.getPossibleValues());
+                    return Objects.equals(currentValue, maxValue);
+                }
+            }
+        }
+        return true; // 如果没有找到特定属性，假设成熟
+    }
+    
+    private static boolean checkMysticalAgricultureMaturity(BlockState state) {
+        // 神秘农艺的特殊成熟度检测逻辑
+        for (Property<?> property : state.getProperties()) {
+            String propName = property.getName();
+            if (propName.equals("age") || propName.equals("growth") || propName.equals("stage")) {
+                if (property.getValueClass() == Integer.class) {
+                    @SuppressWarnings("unchecked")
+                    Property<Integer> intProperty = (Property<Integer>) property;
+                    Integer currentValue = state.getValue(intProperty);
+                    Integer maxValue = Collections.max(intProperty.getPossibleValues());
+                    return Objects.equals(currentValue, maxValue);
+                }
+            }
+        }
+        return true; // 如果没有找到特定属性，假设成熟
     }
 
     private boolean isInventoryFull() {
